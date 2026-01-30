@@ -7,3 +7,6 @@ llada/evals_results/
 dream/evals_results/
 .DS_Store
 **/.DS_Store
+nsys_profiles
+ncu_profiles
+command_list.txt

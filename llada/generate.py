@@ -84,7 +84,7 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 
 @ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None, enable_nvtx=False):
     '''
     Args:
         model: Mask predictor.
@@ -96,7 +96,12 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
+        enable_nvtx: Enable NVTX profiling markers.
     '''
+    if enable_nvtx:
+        nvtx.range_push("generate_baseline")
+        nvtx.range_push("initialization")
+    
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
@@ -106,31 +111,68 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     assert steps % num_blocks == 0
     steps = steps // num_blocks
 
+    if enable_nvtx:
+        nvtx.range_pop()  # initialization
+
     nfe = 0
     for num_block in range(num_blocks):
+        if enable_nvtx:
+            nvtx.range_push(f"block_{num_block}")
+            nvtx.range_push("compute_transfer_tokens")
+        
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+        
+        if enable_nvtx:
+            nvtx.range_pop()  # compute_transfer_tokens
+        
         i = 0
         while True:
+            if enable_nvtx:
+                nvtx.range_push(f"step_{i}")
+                nvtx.range_push("model_forward")
+            
             nfe += 1
             mask_index = (x == mask_id)
             logits = model(x).logits
+            
+            if enable_nvtx:
+                nvtx.range_pop()  # model_forward
+                nvtx.range_push("get_transfer_index")
+            
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
+            
+            if enable_nvtx:
+                nvtx.range_pop()  # get_transfer_index
+                nvtx.range_push("token_update")
+            
             x[transfer_index] = x0[transfer_index]
+            
+            if enable_nvtx:
+                nvtx.range_pop()  # token_update
+                nvtx.range_pop()  # step_{i}
+            
             i += 1
             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
                 break
+        
+        if enable_nvtx:
+            nvtx.range_pop()  # block_{num_block}
+    
+    if enable_nvtx:
+        nvtx.range_pop()  # generate_baseline
+    
     return x, nfe
 
 
 
 @ torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None, enable_nvtx=False):
     '''
     Args:
         model: Mask predictor.
@@ -142,7 +184,12 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
+        enable_nvtx: Enable NVTX profiling markers.
     '''
+    if enable_nvtx:
+        nvtx.range_push("generate_prefix_cache")
+        nvtx.range_push("initialization")
+    
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
@@ -152,17 +199,35 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     assert steps % num_blocks == 0
     steps = steps // num_blocks
 
+    if enable_nvtx:
+        nvtx.range_pop()  # initialization
+
     nfe = 0
             
     for num_block in range(num_blocks):
+        if enable_nvtx:
+            nvtx.range_push(f"block_{num_block}")
+        
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
+        if enable_nvtx:
+            nvtx.range_push("compute_transfer_tokens")
+        
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
+        if enable_nvtx:
+            nvtx.range_pop()  # compute_transfer_tokens
+            nvtx.range_push("initial_forward_with_cache")
+
         output = model(x, use_cache=True)
         past_key_values = output.past_key_values
+
+        if enable_nvtx:
+            nvtx.range_pop()  # initial_forward_with_cache
+            nvtx.range_push("step_0")
+            nvtx.range_push("get_transfer_index")
 
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
@@ -170,7 +235,16 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
         else:
             x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+        
+        if enable_nvtx:
+            nvtx.range_pop()  # get_transfer_index
+            nvtx.range_push("token_update")
+        
         x[transfer_index] = x0[transfer_index]
+
+        if enable_nvtx:
+            nvtx.range_pop()  # token_update
+            nvtx.range_push("cache_truncation")
 
         new_past_key_values = []
         for i in range(len(past_key_values)):
@@ -179,17 +253,31 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
                 new_past_key_values[i] += (past_key_values[i][j][:, :, :current_block_start],)
         
         past_key_values = new_past_key_values
+        
+        if enable_nvtx:
+            nvtx.range_pop()  # cache_truncation
+            nvtx.range_pop()  # step_0
+        
         nfe += 1
         
         i = 1
         while True:
             if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
                 break
+            
+            if enable_nvtx:
+                nvtx.range_push(f"step_{i}")
+                nvtx.range_push("model_forward_cached")
+            
             nfe += 1
             mask_index = (x[:, current_block_start:] == mask_id)
             mask_index[:, block_length:] = 0
 
             logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
+
+            if enable_nvtx:
+                nvtx.range_pop()  # model_forward_cached
+                nvtx.range_push("get_transfer_index")
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -200,18 +288,36 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
                                                 x[:, current_block_start:], None, factor)
+            
+            if enable_nvtx:
+                nvtx.range_pop()  # get_transfer_index
+                nvtx.range_push("token_update")
+            
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
+            
+            if enable_nvtx:
+                nvtx.range_pop()  # token_update
+                nvtx.range_pop()  # step_{i}
             
             i += 1
 
+        if enable_nvtx:
+            nvtx.range_pop()  # block_{num_block}
+
+    if enable_nvtx:
+        nvtx.range_pop()  # generate_prefix_cache
 
     return x, nfe
 
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None, enable_nvtx=False
 ):
+    if enable_nvtx:
+        nvtx.range_push("generate_dual_cache")
+        nvtx.range_push("initialization")
+    
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
     assert gen_length % block_length == 0
@@ -224,20 +330,38 @@ def generate_with_dual_cache(
     x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
     x[:, :Lp] = prompt
 
+    if enable_nvtx:
+        nvtx.range_pop()  # initialization
+
     nfe = 0
 
     for nb in range(num_blocks):
+        if enable_nvtx:
+            nvtx.range_push(f"block_{nb}")
+        
         s = Lp + nb * block_length
         e = s + block_length
+
+        if enable_nvtx:
+            nvtx.range_push("compute_transfer_tokens")
 
         # Masks/indices for the current block
         block_mask_index = (x[:, s:e] == mask_id)  # (B, block_length)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
+        if enable_nvtx:
+            nvtx.range_pop()  # compute_transfer_tokens
+            nvtx.range_push("initial_forward_with_cache")
+
         # 1) Warm KV-cache on the full prefix once per block
         out_full = model(x, use_cache=True)
         past_key_values = out_full.past_key_values
         nfe += 1
+
+        if enable_nvtx:
+            nvtx.range_pop()  # initial_forward_with_cache
+            nvtx.range_push("step_0")
+            nvtx.range_push("get_transfer_index")
 
         # Build a replace_position tensor indicating the block range (static slice)
         replace_position = torch.zeros_like(x, dtype=torch.bool)
@@ -258,8 +382,16 @@ def generate_with_dual_cache(
                 out_full.logits, temperature, remasking, global_mask_index, x, None, factor
             )
 
+        if enable_nvtx:
+            nvtx.range_pop()  # get_transfer_index
+            nvtx.range_push("token_update")
+
         # In-place update via torch.where (no tensor-slice assignment with mask)
         x = torch.where(transfer_index, x0, x)
+
+        if enable_nvtx:
+            nvtx.range_pop()  # token_update
+            nvtx.range_pop()  # step_0
 
         # 2) Semi-autoregressive refinement, fixed number of steps (graph-friendly)
         #    Each iteration runs on the current block with KV-cache and replace_position
@@ -267,9 +399,18 @@ def generate_with_dual_cache(
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+            
+            if enable_nvtx:
+                nvtx.range_push(f"step_{i}")
+                nvtx.range_push("model_forward_cached")
+            
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*
+
+            if enable_nvtx:
+                nvtx.range_pop()  # model_forward_cached
+                nvtx.range_push("get_transfer_index")
 
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
@@ -284,12 +425,26 @@ def generate_with_dual_cache(
                     logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, factor
                 )
 
+            if enable_nvtx:
+                nvtx.range_pop()  # get_transfer_index
+                nvtx.range_push("token_update")
+
             # Merge back into x[:, s:e] using torch.where (no masked slice assignment)
             blk_old = x[:, s:e]
             blk_new = torch.where(transfer_idx_blk, x0_blk, blk_old)
             x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)  # static concatenation
 
+            if enable_nvtx:
+                nvtx.range_pop()  # token_update
+                nvtx.range_pop()  # step_{i}
+
             nfe += 1
+
+        if enable_nvtx:
+            nvtx.range_pop()  # block_{nb}
+
+    if enable_nvtx:
+        nvtx.range_pop()  # generate_dual_cache
 
     return x, nfe
 

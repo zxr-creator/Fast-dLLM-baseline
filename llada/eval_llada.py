@@ -37,6 +37,8 @@ from generate import generate, generate_with_prefix_cache, generate_with_dual_ca
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
+from torch.cuda import nvtx
+import torch.cuda as cuda
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -67,6 +69,7 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        enable_nvtx=False,
         **kwargs,
     ):
         '''
@@ -85,6 +88,7 @@ class LLaDAEvalHarness(LM):
                              we recommend setting is_check_greedy to False. This configuration causes suffix_greedy_prediction() to return False 
                              by default, significantly accelerating the evaluation process.
             cfg_scale: Unsupervised classifier-free guidance scale.
+            enable_nvtx: Enable NVTX profiling markers for Nsight Systems.
         '''
         super().__init__()
 
@@ -132,6 +136,11 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.enable_nvtx = enable_nvtx
+        
+        # Convert string 'True'/'False' to boolean if needed
+        if isinstance(self.enable_nvtx, str):
+            self.enable_nvtx = self.enable_nvtx.lower() == 'true'
     @property
     def rank(self):
         return self._rank
@@ -302,7 +311,13 @@ class LLaDAEvalHarness(LM):
         if len(batched_requests[-1]) == 0:
             batched_requests.pop()
 
+        # Start CUDA profiler for nsys capture
+        if self.enable_nvtx:
+            cuda.cudart().cudaProfilerStart()
+            nvtx.range_push("evaluation_loop")
+
         start_time = time.time()
+        batch_idx = 0
 
         for batch in tqdm(batched_requests, desc="Generating..."):
             batched_input_ids = []
@@ -336,16 +351,26 @@ class LLaDAEvalHarness(LM):
 
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
+            
+            if self.enable_nvtx:
+                nvtx.range_push(f"batch_{batch_idx}")
+                nvtx.range_push("generation")
+            
             if self.use_cache:
                 if self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor, enable_nvtx=self.enable_nvtx)
                 else:
                     generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor, enable_nvtx=self.enable_nvtx)
             else:
                 generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor, enable_nvtx=self.enable_nvtx)
+            
+            if self.enable_nvtx:
+                torch.cuda.synchronize()
+                nvtx.range_pop()  # generation
+                nvtx.range_push("post_processing")
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
                 generated_answer_ids = generated_answer[:, input_ids.shape[1]:]
@@ -366,6 +391,9 @@ class LLaDAEvalHarness(LM):
                         num_nfe += nfe
                     generated_answer_i = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
                     batched_generated_answer.append(generated_answer_i)
+            
+            if self.enable_nvtx:
+                nvtx.range_pop()  # post_processing
 
             # output.append(generated_answer)
             output.extend(batched_generated_answer)
@@ -383,8 +411,18 @@ class LLaDAEvalHarness(LM):
                 print('nfe: ', nfe)
                 print('avg nfe: ', num_nfe / len(output))
                 print('=' * 20, end='\n\n')
+            
+            if self.enable_nvtx:
+                nvtx.range_pop()  # batch_{batch_idx}
+            batch_idx += 1
             # self.accelerator.wait_for_everyone()
+        
         end_time = time.time()
+        
+        # Stop CUDA profiler for nsys capture
+        if self.enable_nvtx:
+            nvtx.range_pop()  # evaluation_loop
+            cuda.cudart().cudaProfilerStop()
         if self.show_speed:
             print(f"Total number of tokens generated: {num_tokens}")
             print(f"Total time taken: {end_time - start_time} seconds")
